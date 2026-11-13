@@ -1,0 +1,1901 @@
+# ================= IMPORTS =================
+import os
+import re
+import uuid
+import time
+import hashlib
+import cv2
+import numpy as np
+from datetime import datetime, timezone
+from flask import Blueprint, request, jsonify
+
+import gc
+import psutil
+# Production-safe YOLO import
+from ultralytics import YOLO
+import torch
+from concurrent.futures import ThreadPoolExecutor
+
+# Global thread pool for background tasks (e.g., image upload)
+executor = ThreadPoolExecutor(max_workers=4)
+
+from config import Config
+import logging
+logger = logging.getLogger(__name__)
+
+IS_RAILWAY = os.environ.get("RAILWAY_ENVIRONMENT", "").strip().lower() in ("true", "1", "yes")
+
+from utils.detection_logger import DetectionLogger
+from utils.helpers import (
+    is_duplicate,
+    upload_with_retry,
+    db_insert_with_retry,
+)
+
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
+# ================= INIT =================
+ai_bp = Blueprint("ai", __name__)
+
+# ================= MODEL (LAZY LOADING) =================
+model = None
+
+def load_model(dlog: "DetectionLogger | None" = None):
+    global model
+    
+    if model is None:
+        if dlog:
+            dlog.model_loading()
+        print("Loading YOLO model...")
+        print("📂 Current directory:", os.getcwd())
+        print("📂 Files:", os.listdir())
+        model_path = os.path.join("models", "best.pt")
+        
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"❌ MODEL NOT FOUND at {model_path}. Please ensure it exists.")
+            
+        try:
+            print("Loading model from:", os.path.abspath(model_path))
+            model = YOLO(model_path)
+            
+            # PyTorch Optimizations for Live Detection FPS
+            if torch.cuda.is_available():
+                torch.backends.cudnn.benchmark = True
+                
+            if dlog:
+                dlog.model_loaded()
+            print("YOLO model loaded successfully.")
+            print("MODEL CLASSES:", model.names)
+        except Exception as e:
+            print(f"❌ Error loading YOLO: {e}")
+            raise e
+    return model
+
+
+# ================= TRIGGER STATE =================
+trigger_flag      = False
+last_trigger_time = 0
+last_sensor       = {"diff": 0.0, "vib": 0.0, "spike_ms": 0}
+processing        = False   # Global request lock — prevents duplicate inserts
+
+
+@ai_bp.route("/trigger", methods=["POST"])
+def trigger():
+    """ESP32 hardware trigger. Stores sensor payload and signals Android to capture."""
+    global trigger_flag, last_trigger_time, last_sensor
+    now = time.time()
+    if now - last_trigger_time < 3:
+        return jsonify({"status": "ignored", "reason": "cooldown"})
+
+    try:
+        diff     = float(request.form.get("diff",     0) or 0)
+        vib      = float(request.form.get("vib",      0) or 0)
+        spike_ms = float(request.form.get("spike_ms", 0) or 0)
+    except (ValueError, TypeError):
+        diff, vib, spike_ms = 0.0, 0.0, 0.0
+
+    last_sensor = {"diff": diff, "vib": vib, "spike_ms": spike_ms}
+    trigger_flag      = True
+    last_trigger_time = now
+    print(f"[SENSOR] ESP32 TRIGGER | diff={diff} vib={vib} spike_ms={spike_ms}")
+    return jsonify({"status": "ok", "diff": diff, "vib": vib, "spike_ms": spike_ms})
+
+
+@ai_bp.route("/check", methods=["GET"])
+def check():
+    """Android polling endpoint. Returns capture=True once per trigger."""
+    global trigger_flag
+    if trigger_flag:
+        trigger_flag = False
+        print("📸 Capture signal sent to Android")
+        return jsonify({"capture": True})
+    return jsonify({"capture": False})
+
+
+
+
+
+# ================= SEVERITY ORDERING =================
+SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+def max_severity(a: str, b: str) -> str:
+    """Return the higher of two severity strings. Never downgrade existing records."""
+    return a if SEVERITY_RANK.get(a, 0) >= SEVERITY_RANK.get(b, 0) else b
+
+
+SEVERITY_ORDER = ["low", "medium", "high", "critical"]
+
+def bump_severity(level: str, step: int = 1) -> str:
+    if level not in SEVERITY_ORDER:
+        return level
+    idx = min(len(SEVERITY_ORDER) - 1, SEVERITY_ORDER.index(level) + step)
+    return SEVERITY_ORDER[idx]
+
+def reduce_severity(level: str, step: int = 1) -> str:
+    if level not in SEVERITY_ORDER:
+        return level
+    idx = max(0, SEVERITY_ORDER.index(level) - step)
+    return SEVERITY_ORDER[idx]
+
+
+def score_user_report_severity(img: np.ndarray, detections: list) -> dict:
+    """
+    Severity for user reports based on weighted factors:
+    - Pothole size (bbox area)      40%
+    - Number of potholes            30%
+    - Average AI confidence          20%
+    Returns severity tier (low, medium, high, critical) and weighted score.
+    """
+    h, w = img.shape[:2]
+    img_area = float(max(1, h * w))
+
+    valid = []
+    for d in detections:
+        conf = float(d.get("confidence", 0.0) or 0.0)
+        # Filter detections below user report confidence threshold (0.5)
+        if conf < 0.5:
+            continue
+        box = d.get("box") or [0, 0, 0, 0]
+        x1, y1, x2, y2 = [int(max(0, v)) for v in box]
+        x2 = min(x2, w - 1)
+        y2 = min(y2, h - 1)
+        bw = max(0, x2 - x1)
+        bh = max(0, y2 - y1)
+        ratio = (bw * bh) / img_area
+        if ratio <= 0:
+            continue
+        valid.append({
+            **d,
+            "bbox_ratio": round(ratio, 6),
+            "confidence": conf
+        })
+
+    # No detections -> N/A severity
+    if not valid:
+        return {
+            "severity": None,
+            "score": 0,
+            "valid_detections": [],
+            "primary": None
+        }
+
+    pothole_count = len(valid)
+    avg_confidence = sum(d["confidence"] for d in valid) / pothole_count
+    max_bbox_ratio = max(d["bbox_ratio"] for d in valid)
+
+    # Weighted score (0-100) using specified percentages
+    weighted_score = (
+        40 * max_bbox_ratio +
+        30 * (pothole_count / (pothole_count + 4)) +
+        20 * avg_confidence
+    ) * 100
+    weighted_score = int(round(min(100, weighted_score)))
+
+    # Determine severity tier
+    if pothole_count >= 4 and avg_confidence >= 0.70:
+        sev = "critical"
+    elif pothole_count >= 2 or max_bbox_ratio > 0.15:
+        sev = "high"
+    elif pothole_count == 1:
+        if max_bbox_ratio < 0.02:
+            sev = "low"
+        elif max_bbox_ratio < 0.08:
+            sev = "medium"
+        else:
+            sev = "high"
+    else:
+        sev = "low"
+
+    primary = max(valid, key=lambda d: d.get("bbox_ratio", 0.0))
+    return {
+        "severity": sev,
+        "score": weighted_score,
+        "valid_detections": valid,
+        "primary": primary
+    }
+
+
+
+def road_scene_check(img: np.ndarray) -> bool:
+    """
+    Lightweight road/outdoor heuristic:
+    - prefer texture in lower half
+    - avoid very flat indoor-like regions
+    """
+    h, w = img.shape[:2]
+    lower = img[h // 2:, :]
+    gray = cv2.cvtColor(lower, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 60, 160)
+    edge_density = float(np.mean(edges > 0))
+    brightness = float(np.mean(gray))
+    return edge_density > 0.02 and brightness > 30
+
+
+def dominant_face_present(img: np.ndarray) -> bool:
+    """
+    Reject selfie-like captures where a face occupies major frame area.
+    """
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
+        if len(faces) == 0:
+            return False
+        h, w = gray.shape[:2]
+        img_area = float(max(1, h * w))
+        max_face_area = max((fw * fh for (_, _, fw, fh) in faces), default=0.0)
+        return (max_face_area / img_area) > 0.18
+    except Exception:
+        return False
+
+
+def exif_metadata_valid(file_bytes: bytes) -> bool:
+    if Image is None:
+        return False
+    try:
+        from io import BytesIO
+        pil_img = Image.open(BytesIO(file_bytes))
+        exif = pil_img.getexif()
+        if not exif:
+            return False
+        has_time = bool(exif.get(306) or exif.get(36867))  # DateTime / DateTimeOriginal
+        has_device = bool(exif.get(271) or exif.get(272))  # Make / Model
+        return has_time and has_device
+    except Exception:
+        return False
+
+
+# ================= UPDATE EXISTING POTHOLE =================
+def update_existing_pothole(supabase, pothole_id: int, new_severity: str):
+    """
+    Update an existing pothole record:
+    - Severity is only raised, never lowered.
+    - last_reported_at is always refreshed.
+    - report_count is incremented via RPC.
+    """
+    try:
+        # Fetch existing severity
+        existing = supabase.table("potholes").select("severity").eq("id", pothole_id).execute()
+        if existing.data:
+            old_severity = existing.data[0].get("severity", "low")
+            final_severity = max_severity(old_severity, new_severity)
+        else:
+            final_severity = new_severity
+
+        supabase.table("potholes") \
+            .update({
+                "severity": final_severity,
+                "last_reported_at": datetime.now(timezone.utc).isoformat()
+            }) \
+            .eq("id", pothole_id) \
+            .execute()
+
+        # Increment report count via RPC
+        try:
+            supabase.rpc("increment_report_count", {"row_id": pothole_id}).execute()
+        except Exception as rpc_err:
+            print(f"[DB] RPC increment failed (non-critical): {rpc_err}")
+
+        print(f"[DB] Pothole {pothole_id} updated → severity={final_severity}, count++")
+    except Exception as e:
+        print(f"[DB] ❌ Update failed: {e}")
+
+
+# ================= SPIKE VALIDATION =================
+def classify_spike(spike_ms: float) -> str:
+    """
+    Categorize spike by duration:
+      < 200ms  → noise
+      200–600ms → pothole
+      > 600ms  → speed_breaker
+    """
+    if spike_ms <= 0:
+        return "unknown"  # Not yet reported by ESP32, don't block
+    elif spike_ms < 200:
+        return "noise"
+    elif spike_ms <= 600:
+        return "pothole"
+    else:
+        return "speed_breaker"
+
+
+# ================= YOLO INFERENCE ON SINGLE FRAME =================
+def run_inference(m, img: np.ndarray) -> tuple:
+    """Run YOLO on a single image. Returns (results, detections_list)."""
+    detections = []
+    results = None
+    
+    if m is None:
+        return None, []
+
+    try:
+        start = time.time()
+        
+        # 1. IMPROVED BLUR HANDLING
+        # Fast moving vehicles cause motion blur. 
+        # Extremely low Laplacian variance means the image is a complete smear.
+        # Reduced from 5 to 3 to allow more realistically blurred road captures.
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+        del gray
+        if blur_score < 5:
+            return None, []
+        
+        # 2. OPTIMIZED CONFIDENCE THRESHOLD
+        # A 0.15 threshold ensures we don't miss slightly deformed potholes
+        # captured at an angle, while the backend 'strong_detections' logic
+        # still filters out pure noise later.
+        with torch.inference_mode():
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            results = m.predict(
+                source=img,
+                conf=0.08,
+                iou=0.30,
+                imgsz=640,
+                device=device,
+                half=torch.cuda.is_available(),
+                verbose=False
+            )
+            
+        elapsed = (time.time() - start) * 1000
+        print(f"[AI] Inference: {elapsed:.0f}ms")
+        
+        h, w = img.shape[:2]
+        img_area = float(max(1, h * w))
+        
+        for r in results:
+            if r.boxes is None:
+                continue
+            for box in r.boxes:
+                cls  = int(box.cls[0])
+                conf = float(box.conf[0])
+                x1, y1, x2, y2 = map(float, box.xyxy[0])
+                w_px, h_px = x2 - x1, y2 - y1
+                ratio = (max(0.0, w_px) * max(0.0, h_px)) / img_area
+
+                if w_px <= 1 or h_px <= 1:
+                    continue
+
+                if ratio <= 0:
+                    continue
+
+                # Keep center position calculation for select_best_frame logic
+                center_x = (x1 + x2) / 2.0
+                center_y = (y1 + y2) / 2.0
+
+                center_x_ratio = center_x / float(max(1.0, w))
+                center_y_ratio = center_y / float(max(1.0, h))
+
+                detections.append({
+                    "type":       m.names[cls],
+                    "confidence": round(conf, 2),
+                    "box":        [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
+                    "max_dim":    round(max(w_px, h_px), 1),
+                    "bbox_ratio": round(ratio, 4),
+                    "center_x_ratio": round(center_x_ratio, 4)
+                })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[AI] Inference error: {e}")
+        raise e
+    return results, detections
+
+
+# ================= BEST FRAME SELECTION =================
+def select_best_frame(frames: list) -> tuple:
+    """
+    Given a list of (results, detections, img, idx, quality) tuples,
+    pick the Best 10 Live Frames with the highest weighted score.
+    Returns (results, detections, img, idx, score) of the best frame.
+    """
+    if not frames:
+        return None, [], None, -1, -1
+        
+    best_score = -1
+    best = frames[0]
+    for frame in frames:
+        results, detections, img, idx, quality = frame
+        if detections:
+            primary = max(detections, key=lambda d: d.get("bbox_ratio", 0.0))
+            
+            yolo_conf = primary.get("confidence", 0.0)
+            bbox_ratio = primary.get("bbox_ratio", 0.0)
+            center_x_ratio = primary.get("center_x_ratio", 0.5)
+            
+            center_pos = 1.0 - abs(center_x_ratio - 0.5) * 2.0
+            
+            score = (0.40 * yolo_conf * 100) + (0.30 * bbox_ratio * 100) + (0.20 * quality) + (0.10 * center_pos * 100)
+            
+            if score > best_score:
+                best_score = score
+                best = frame
+    return (best[0], best[1], best[2], best[3], best_score)
+
+
+# ================= AI SEVERITY CALCULATION =================
+def decide_ai_severity(detections: list) -> str:
+    """
+    Severity is derived ONLY from:
+      1. Number of potholes detected
+      2. Average confidence of all detections
+      3. Largest bounding-box ratio (max_bbox)
+
+    Severity is completely independent of approval status.
+    Evaluated top-down: the first matching tier wins.
+
+    CRITICAL (highest)
+        4+ potholes
+        OR 2+ large potholes (max_bbox >= 0.30)
+        OR largest pothole > 30% of image AND avg_conf > 70%
+
+    HIGH
+        3+ potholes
+        OR largest pothole > 15% of image
+        OR avg_conf > 70%
+
+    MEDIUM
+        2 potholes
+        OR 1 medium-sized pothole (max_bbox >= 0.05)
+        OR avg_conf 40–70%
+
+    LOW (default)
+        1 pothole, small size, avg_conf < 40%
+    """
+    if not detections:
+        return "low"
+
+    pothole_count = len(detections)
+    avg_conf      = sum(d.get("confidence", 0.0) for d in detections) / pothole_count
+    max_bbox      = max(d.get("bbox_ratio",  0.0) for d in detections)
+    large_potholes = sum(1 for d in detections if d.get("bbox_ratio", 0.0) >= 0.15)
+
+    print(
+        f"[SEVERITY] count={pothole_count} "
+        f"avg_conf={avg_conf:.4f} "
+        f"max_bbox={max_bbox:.4f} "
+        f"large={large_potholes}"
+    )
+
+    # ── CRITICAL ─────────────────────────────────────────────────────────────
+    if (
+        (pothole_count >= 4 and avg_conf >= 0.80)
+        or (large_potholes >= 2 and avg_conf >= 0.70)
+        or (max_bbox > 0.30 and avg_conf >= 0.70)
+    ):
+        return "critical"
+
+    # ── HIGH ─────────────────────────────────────────────────────────────────
+    if (
+        pothole_count >= 3
+        or (max_bbox > 0.15 and avg_conf >= 0.60)
+    ):
+        return "high"
+
+    # ── MEDIUM ───────────────────────────────────────────────────────────────
+    if (
+        pothole_count >= 2
+        or max_bbox >= 0.05
+        or 0.40 <= avg_conf <= 0.70
+    ):
+        return "medium"
+
+    # ── LOW (default) ────────────────────────────────────────────────────────
+    return "low"
+
+
+
+from utils.duplicate_consolidation import (
+    calculate_quality_score,
+    find_duplicate_pothole,
+    compare_quality,
+    insert_new_pothole,
+    update_existing_pothole,
+    refresh_duplicate_timestamp
+)
+
+# ================= /analyze ENDPOINT =================
+@ai_bp.route("/analyze", methods=["POST"])
+def analyze():
+    """
+    Main fusion pipeline:
+    1. Validate inputs
+    2. Load sensor state
+    3. Classify spike shape
+    4. Run YOLO inference on all submitted frames
+    5. Select best frame
+    6. Decide severity (sensor authority)
+    7. Upload annotated image
+    8. Persist (insert or update duplicate)
+    """
+    global processing
+    if processing:
+        print("[FUSION] Already processing → skip")
+        return jsonify({"status": "busy"})
+
+    processing = True
+    _t_total_start = time.time()
+    dlog = DetectionLogger()
+
+    try:
+        from app import supabase
+
+        # ----- Detect source (Android app vs generic API) -----
+        ua = request.headers.get("User-Agent", "")
+        source = "Android App" if ("okhttp" in ua.lower() or "dalvik" in ua.lower() or "android" in ua.lower()) else "API"
+        first_file = request.files.getlist("image")
+        first_fname = first_file[0].filename if first_file else "N/A"
+        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+
+        # Read lat/lon early for logging
+        try:
+            _lat_log = float(request.form.get("lat", "0"))
+            _lon_log = float(request.form.get("lon", "0"))
+        except Exception:
+            _lat_log, _lon_log = 0.0, 0.0
+
+        dlog.request_start(
+            source=source,
+            filename=first_fname,
+            byte_size=None,
+            latitude=_lat_log,
+            longitude=_lon_log,
+            user_id=None,
+            client_ip=client_ip,
+        )
+
+        m = load_model(dlog)
+        if m is None:
+            print("[FUSION] Running sensor-only mode (YOLO unavailable)")
+        
+        # ----- 1. Selected Frames -----
+        raw_files = request.files.getlist("image")
+        qualities_str = request.form.getlist("frame_quality")
+
+        if not raw_files:
+            single = request.files.get("image")
+            if single:
+                raw_files = [single]
+                single_q = request.form.get("frame_quality")
+                qualities_str = [single_q] if single_q else []
+
+        raw_files = [f for f in raw_files if f is not None]
+
+        # ----- DEBUG: SAVE RAW UPLOADS -----
+        now_dt = datetime.now()
+        req_folder = f"request_{now_dt.strftime('%Y%m%d_%H%M%S')}_{now_dt.microsecond // 1000:03d}"
+        debug_dir = os.path.join("debug_uploads", req_folder)
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        # SAFE GPS PARSING
+        try:
+            lat = float(request.form.get("lat", "0"))
+            lon = float(request.form.get("lon", "0"))
+        except Exception:
+            lat = 0.0
+            lon = 0.0
+
+        phone_vibration = float(request.form.get("vibration", 0))
+
+        print("====================================================")
+        print("📸 NEW AI ANALYSIS REQUEST")
+        print("====================================================")
+        print(f"Timestamp: {now_dt.isoformat()}")
+        print(f"Latitude: {lat}")
+        print(f"Longitude: {lon}")
+        print(f"Vibration value: {phone_vibration}")
+        print(f"Number of uploaded images: {len(raw_files)}")
+
+        for i, f in enumerate(raw_files):
+            save_path = os.path.join(debug_dir, f"frame_{i}.jpg")
+            f.save(save_path)
+            f.stream.seek(0)
+
+        # STRICT VALIDATION
+        valid_files = []
+
+        for i, f in enumerate(raw_files):
+            try:
+                data = f.read()
+
+                if len(data) > 1000:
+                    q_val = 100.0
+                    try:
+                        if i < len(qualities_str) and qualities_str[i]:
+                            q_val = float(qualities_str[i])
+                    except (ValueError, TypeError):
+                        pass
+                    valid_files.append((f, data, q_val))
+
+            except Exception as e:
+                print("[LIVE BUFFER ERROR]", e)
+
+        files = valid_files
+        request_filename = files[0][0].filename if files else "unknown"
+
+        if len(files) == 0:
+            return jsonify({
+                "error": "No valid images"
+            }), 400
+
+
+        # ----- 2. Sensor State -----
+        diff     = last_sensor.get("diff",     0.0)
+        vib      = last_sensor.get("vib",      0.0)
+        spike_ms = last_sensor.get("spike_ms", 0)
+        sensor   = {"diff": diff, "vib": vib, "spike_ms": spike_ms}
+
+        periodic_mode = diff <= 0.5
+
+        # ----- 3. Spike Classification -----
+        spike_class = classify_spike(spike_ms)
+        if spike_class == "noise":
+            return jsonify({"status": "ignored", "reason": "noise_spike"})
+        if spike_class == "speed_breaker":
+            return jsonify({"status": "ignored", "reason": "speed_breaker"})
+
+        # ----- 4. Decode & Infer Best 10 Live Frames -----
+        dlog.inference_start()
+        _t_yolo_start = time.time()
+        
+        best_results = None
+        best_detections = []
+        best_img = None
+        best_idx = -1
+        best_score = -1
+        any_valid_frames = False
+
+        for idx, item in enumerate(files):
+            f, file_bytes, q_val = item
+            
+            np_arr = np.frombuffer(file_bytes, np.uint8)
+            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            
+            decode_success = img is not None
+            img_h, img_w, img_c = img.shape if decode_success else (0, 0, 0)
+            
+            print(f"\nImage {idx + 1}")
+            print(f"Filename: {f.filename if hasattr(f, 'filename') else 'unknown'}")
+            print(f"Resolution: {img_w}x{img_h}")
+            print(f"Size: {len(file_bytes) // 1024} KB")
+            
+            del np_arr
+
+            if img is None:
+                continue
+
+            # ===== DEBUG =====
+            if not IS_RAILWAY:
+                cv2.imwrite(f"received_{idx}.jpg", img)
+
+            if m:
+                print("\nRunning YOLO inference...")
+                results, detections = run_inference(m, img)
+                
+                if not detections:
+                    print("No object detected")
+                else:
+                    for d in detections:
+                        print(f"Detected: {d.get('type', 'pothole')}")
+                        print(f"Confidence: {d.get('confidence', 0.0):.2f}")
+
+                strong_detections = [
+                    d for d in detections
+                    if d["confidence"] >= 0.20
+                ]
+
+                if len(strong_detections) > 0:
+                    any_valid_frames = True
+                    # Calculate score manually instead of storing all frames
+                    primary = max(strong_detections, key=lambda d: d.get("bbox_ratio", 0.0))
+                    
+                    yolo_conf = primary.get("confidence", 0.0)
+                    bbox_ratio = primary.get("bbox_ratio", 0.0)
+                    center_x_ratio = primary.get("center_x_ratio", 0.5)
+                    score = calculate_quality_score(yolo_conf, bbox_ratio, q_val, center_x_ratio)
+                    
+                    if score > best_score:
+                        if best_img is not None:
+                            del best_img
+                            del best_results
+                        best_score = score
+                        best_results = results
+                        best_detections = strong_detections
+                        best_img = img.copy()
+                        best_idx = idx
+                
+                del results
+                del detections
+                del strong_detections
+
+            del img
+            gc.collect()
+
+        _yolo_ms = (time.time() - _t_yolo_start) * 1000
+
+        # ----- 5. Best Frame Selection -----
+        print("\n===================================")
+        print("BEST DETECTION")
+        print("===================================")
+        
+        if not any_valid_frames or best_img is None:
+            print("No pothole detected.\n")
+            dlog.no_detection()
+            return jsonify({
+                "success": False,
+                "message": "No pothole detected"
+            })
+
+        if len(best_detections) == 0:
+            print("No pothole detected.\n")
+            dlog.no_detection()
+            return jsonify({
+                "status": "ignored",
+                "reason": "no_ai_detection"
+            })
+
+        best_f_name = files[best_idx][0].filename if best_idx >= 0 and best_idx < len(files) else "unknown"
+        primary_overall = max(best_detections, key=lambda d: d.get("bbox_ratio", 0.0)) if best_detections else {}
+        print(f"Best Image: {best_f_name}")
+        print(f"Class: {primary_overall.get('type', 'pothole')}")
+        print(f"Confidence: {primary_overall.get('confidence', 0.0):.2f}\n")
+
+        # ----- Log each detection -----
+        for i, det in enumerate(best_detections, start=1):
+            dlog.detection(
+                index=i,
+                cls=det.get("type", "pothole"),
+                conf=det.get("confidence", 0.0),
+                box=det.get("box", [0, 0, 0, 0]),
+            )
+        dlog.summary(best_detections)
+
+        # ----- 6. Decision Logic -----
+        # ================= AI APPROVAL LOGIC =================
+        if periodic_mode:
+            best_conf = max(d["confidence"] for d in best_detections)
+            print("[PERIODIC AI] CONF =", best_conf)
+            print("[PERIODIC AI] DETECTIONS =", best_detections)
+
+            # Confidence-based approval workflow
+            # < 30%  → reject immediately (no upload, no DB)
+            # 30-69% → pending in potholes (admin must approve)
+            # >= 70% → auto-approved into potholes
+            if best_conf < 0.30:
+                dlog.log_rejected(request_filename, best_conf)
+                dlog.request_end()
+                return jsonify({"status": "rejected", "reason": "Detection confidence too low."})
+            elif best_conf < 0.70:
+                # Pending — goes into potholes with status='pending'
+                approval_status = "pending"
+                dlog.log_accepted(request_filename, best_conf)
+            else:
+                # Auto-approved — goes into potholes with status='approved'
+                approval_status = "approved"
+                dlog.log_accepted(request_filename, best_conf)
+
+            # Severity is independent of approval status
+            decision = decide_ai_severity(best_detections)
+        else:
+            # Sensor-triggered path: same confidence gates as periodic mode.
+            # < 30%  → reject immediately (no upload, no DB)
+            # 30-69% → pending in potholes
+            # >= 70% → auto-approved
+            _sensor_conf = max((d["confidence"] for d in best_detections), default=0.0)
+            if _sensor_conf < 0.30:
+                dlog.log_rejected(request_filename, _sensor_conf)
+                dlog.request_end()
+                return jsonify({"status": "rejected", "reason": "Detection confidence too low."})
+            elif _sensor_conf < 0.70:
+                approval_status = "pending"
+            else:
+                approval_status = "approved"
+
+            # Severity is independent of approval status
+            decision = decide_ai_severity(best_detections)
+
+        if decision == "ignored":
+            reason = "diff too low" if diff <= 10 else ("no AI detection" if not best_detections else "low confidence")
+            return jsonify({
+                "status":     "ignored",
+                "decision":   decision,
+                "diff":       diff,
+                "spike_ms":   spike_ms,
+                "detections": best_detections
+            })
+
+        # ----- 7. Select Primary Detection -----
+        primary = max(best_detections, key=lambda d: d.get("bbox_ratio", 0.0))
+
+        # ----- 8. Intelligent Duplicate Consolidation or Insert -----
+        now_iso = datetime.now(timezone.utc).isoformat()
+        inserted_id = None
+        action_taken = "INSERT"
+        
+        _t_db_start = time.time()
+        dlog.db_saving()
+        
+        try:
+            pothole_payload = {
+                "latitude":         float(lat),
+                "longitude":        float(lon),
+                "severity":         str(decision),
+                "confidence":       float(primary["confidence"]),
+                "quality_score":    float(best_score),
+                "image_url":        None,   # To be updated by background upload
+                "type":             "pothole",
+                "pothole":          True,
+                "status":           approval_status,
+                "review_required":  approval_status == "pending",
+                "report_count":     1,
+                "created_at":       now_iso,
+                "last_reported_at": now_iso,
+            }
+            
+            duplicate = find_duplicate_pothole(supabase, float(lat), float(lon), "pothole", 10.0, 10)
+            
+            if duplicate is None:
+                action_taken = "INSERT"
+                inserted_id = insert_new_pothole(supabase, pothole_payload)
+            else:
+                inserted_id = duplicate["id"]
+                if compare_quality(best_score, duplicate.get("quality_score")):
+                    action_taken = "UPDATE"
+                    update_existing_pothole(supabase, inserted_id, duplicate, pothole_payload)
+                else:
+                    action_taken = "NO_ACTION"
+                
+                # Always refresh duplicate timestamp and increment count
+                refresh_duplicate_timestamp(supabase, inserted_id, now_iso)
+                
+            print("\nSaving report...")
+            print(f"Report ID: {inserted_id}")
+            print("Report saved successfully.")
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print("========== DB INSERT FAILED ==========")
+            return jsonify({"status": "db_insert_failed", "error": str(e)}), 200
+
+        _db_ms = (time.time() - _t_db_start) * 1000
+        dlog.db_done(report_id=inserted_id)
+        
+        if inserted_id:
+            try:
+                from services.hazard_registry import recalculate_single_hazard_async
+                master_id = f"AI-{inserted_id}"
+                
+                if action_taken == "INSERT" or action_taken == "UPDATE":
+                    new_db_record = pothole_payload.copy()
+                    new_db_record["id"] = inserted_id
+                else:
+                    # For NO_ACTION, we must still pass the duplicate record to the hazard registry
+                    # but updated with the incremented report_count and new last_reported_at
+                    new_db_record = duplicate.copy()
+                    new_db_record["report_count"] = new_db_record.get("report_count", 0) + 1
+                    new_db_record["last_reported_at"] = now_iso
+                
+                # Push the heavy lifting to the background
+                event_type = "new_detection" if action_taken == "INSERT" else "update_detection"
+                recalculate_single_hazard_async(master_id, new_db_record, "AI", event_type)
+            except Exception as ex:
+                print(f"[!] Error updating hazard registry cache: {ex}")
+
+        # ----- 9. Background Image Upload -----
+        base_name = f"fusion_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        if best_results is not None:
+            annotated = best_results[0].plot()
+        else:
+            annotated = best_img
+            
+        def background_upload(supabase_client, pid, b_name, img_array, expected_timestamp):
+            _t_bg_start = time.time()
+            try:
+                # Encode to JPEG with default high quality. Do NOT resize.
+                _, ann_buffer = cv2.imencode('.jpg', img_array)
+                
+                # Upload
+                ann_filename = upload_with_retry(supabase_client, ann_buffer.tobytes(), f"{b_name}_annotated")
+                
+                if ann_filename:
+                    final_url = f"{Config.SUPABASE_URL}/storage/v1/object/public/pothole-images/{ann_filename}"
+                    supabase_client.table("potholes").update({"image_url": final_url}).eq("id", pid).eq("last_reported_at", expected_timestamp).execute()
+            except Exception as e:
+                pass
+            _t_bg_ms = (time.time() - _t_bg_start) * 1000
+            print(f"[PERFORMANCE] Background Upload Time: {_t_bg_ms:.2f}ms")
+
+        if inserted_id and action_taken in ("INSERT", "UPDATE"):
+            executor.submit(background_upload, supabase, inserted_id, base_name, annotated, now_iso)
+
+        # ----- 10. Immediate API Response -----
+        _total_s = time.time() - _t_total_start
+        dlog.timings(yolo_ms=_yolo_ms, upload_ms=0.0, db_ms=_db_ms, total_s=_total_s)
+        dlog.request_end()
+        
+        print("\nAnalysis completed successfully.\n")
+        
+        return jsonify({
+            "status":     "success",
+            "decision":   decision,
+            "diff":       diff,
+            "spike_ms":   spike_ms,
+            "detections": best_detections,
+            "depth":      diff,
+            "vibration":  phone_vibration,
+            "fusion_enabled": True
+        })
+
+    except Exception as e:
+        import traceback
+        print("\n===================================")
+        print("❌ ERROR DURING AI ANALYSIS")
+        print("===================================")
+        traceback.print_exc()
+        print(f"Error Message: {str(e)}\n")
+        dlog.error(e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+    finally:
+        processing = False
+        processing = False
+        gc.collect()
+        gc.collect()
+
+
+def _diag_log(step_name, start_time, req_file, file_bytes, img_arr, mem_before=None):
+    import sys, os, psutil, time, threading, platform
+    from datetime import datetime, timezone
+    from flask import request
+    try:
+        import torch
+        import cv2
+    except:
+        pass
+    
+    caller = sys._getframe(1)
+    func_name = caller.f_code.co_name
+    file_name = caller.f_code.co_filename
+    line_no = caller.f_lineno
+    curr_time = datetime.now(timezone.utc).isoformat()
+    exec_time = f"{(time.time() - start_time):.4f}s" if start_time else "N/A"
+    worker_pid = os.getpid()
+    thread_id = threading.get_ident()
+    is_railway = "RAILWAY_ENVIRONMENT" in os.environ or "RAILWAY_PROJECT_ID" in os.environ
+    
+    try:
+        mem_info = psutil.Process(worker_pid).memory_info().rss / (1024 * 1024)
+        cpu_usage = psutil.cpu_percent()
+    except:
+        mem_info = 0.0
+        cpu_usage = 0.0
+        
+    py_ver = platform.python_version()
+    try:
+        torch_ver = torch.__version__
+        cuda_avail = torch.cuda.is_available()
+        curr_dev = "cuda:0" if cuda_avail else "cpu"
+    except:
+        torch_ver = "N/A"
+        cuda_avail = "N/A"
+        curr_dev = "N/A"
+    
+    try:
+        cv2_ver = cv2.__version__
+    except:
+        cv2_ver = "N/A"
+        
+    fname = req_file.filename if req_file and hasattr(req_file, 'filename') else "N/A"
+    ctype = request.headers.get("Content-Type", "N/A") if request else "N/A"
+    clen = request.headers.get("Content-Length", "N/A") if request else "N/A"
+    
+    img_w, img_h, img_c, img_dtype, num_shape = "N/A", "N/A", "N/A", "N/A", "N/A"
+    if img_arr is not None and hasattr(img_arr, "shape"):
+        num_shape = str(img_arr.shape)
+        img_h = img_arr.shape[0] if len(img_arr.shape) > 0 else "N/A"
+        img_w = img_arr.shape[1] if len(img_arr.shape) > 1 else "N/A"
+        img_c = img_arr.shape[2] if len(img_arr.shape) > 2 else 1
+        img_dtype = str(img_arr.dtype)
+        
+    fsize = len(file_bytes) if file_bytes is not None else "N/A"
+    if mem_before is None:
+        mem_before = mem_info
+    
+    print(f"\n========== {step_name} ==========")
+    print(f"Current Function: {func_name}")
+    print(f"Current File: {file_name}")
+    print(f"Current Line Number: {line_no}")
+    print(f"Current Time: {curr_time}")
+    print(f"Execution Time: {exec_time}")
+    print(f"Memory Before: {mem_before:.2f} MB")
+    print(f"Memory After: {mem_info:.2f} MB")
+    print(f"CPU Usage: {cpu_usage}%")
+    print(f"Worker PID: {worker_pid}")
+    print(f"Thread ID: {thread_id}")
+    print(f"Railway Environment: {is_railway}")
+    print(f"Python Version: {py_ver}")
+    print(f"Torch Version: {torch_ver}")
+    print(f"OpenCV Version: {cv2_ver}")
+    print(f"CUDA Available: {cuda_avail}")
+    print(f"Current Device: {curr_dev}")
+    print(f"Filename: {fname}")
+    print(f"Content Type: {ctype}")
+    print(f"Content Length: {clen}")
+    print(f"Image Width: {img_w}")
+    print(f"Image Height: {img_h}")
+    print(f"Image Channels: {img_c}")
+    print(f"Image dtype: {img_dtype}")
+    print(f"Image Size: {fsize}")
+    print(f"NumPy Shape: {num_shape}")
+    print("==================================================\n")
+
+# ================= USER REPORT ENDPOINT =================
+@ai_bp.route("/user-report", methods=["POST"])
+def user_report():
+    """Analyze a user report with hybrid AI logic and return preview payload."""
+    from app import supabase
+    import os
+    import psutil
+
+    _t_total_start = time.time()
+    _mem_start = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024) if 'psutil' in globals() else 0.0
+    _diag_log("STEP 1: Request received", _t_total_start, None, None, None, _mem_start)
+
+    # ── PERF PROFILE ─────────────────────────────────────────────────────────
+    _perf_t0 = time.perf_counter()  # high-resolution wall-clock start
+    print("==============================")
+    print("PERFORMANCE PROFILE")
+    print("==============================")
+    print(f"[PERF] Request Received\n{time.perf_counter() - _perf_t0:.2f} sec")
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    dlog = DetectionLogger()
+
+    file = request.files.get("image")
+    _diag_log("STEP 2: Headers", _t_total_start, file, None, None, _mem_start)
+    
+    _diag_log("STEP 3: Multipart parsing", _t_total_start, file, None, None, _mem_start)
+    
+    lat = request.form.get("lat") or request.form.get("latitude")
+    lon = request.form.get("lon") or request.form.get("longitude")
+
+    if not file or not lat or not lon:
+        return jsonify({"error": "Missing image or location"}), 400
+
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except ValueError:
+        return jsonify({"error": "Invalid coordinates"}), 400
+
+    # --- Preprocessing & Validation ---
+    # Decode image once. AI uses this frame; upload uses annotated or original.
+    try:
+        file_bytes = file.read()  # Preserve original bytes from upload
+        _diag_log("STEP 4: Image read", _t_total_start, file, file_bytes, None, _mem_start)
+        print(f"[PERF] Images Loaded\n{time.perf_counter() - _perf_t0:.2f} sec")
+        byte_size = len(file_bytes or b"")
+        if byte_size == 0:
+            return jsonify({"error": "Empty image data"}), 400
+
+        _t_decode_start = time.time()
+        
+        # --- Diagnostic Logging Variables ---
+        worker_pid = os.getpid()
+        is_railway = "RAILWAY_ENVIRONMENT" in os.environ or "RAILWAY_PROJECT_ID" in os.environ
+        try:
+            current_mem = psutil.Process(worker_pid).memory_info().rss / (1024 * 1024)
+            current_cpu = psutil.cpu_percent()
+        except Exception:
+            current_mem = 0.0
+            current_cpu = 0.0
+
+        log_info = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "client_ip": request.headers.get("X-Forwarded-For", request.remote_addr),
+            "user_agent": request.headers.get("User-Agent", "N/A"),
+            "content_type": request.headers.get("Content-Type", "N/A"),
+            "content_length": request.headers.get("Content-Length", "N/A"),
+            "filename": getattr(file, "filename", "N/A") if file else "N/A",
+            "extension": os.path.splitext(getattr(file, "filename", ""))[1] if file and hasattr(file, "filename") else "N/A",
+            "file_size": byte_size,
+            "capture_source": request.form.get("capture_source", "N/A"),
+            "pil_succeeded": False,
+            "cv2_fallback": False,
+            "decode_failed": False,
+            "decode_exception": "None",
+            "exif_available": False,
+            "orientation": "N/A",
+            "worker_pid": worker_pid,
+            "railway_env": is_railway,
+            "initial_memory_mb": current_mem,
+            "initial_cpu_percent": current_cpu
+        }
+        
+        # --- Mobile Image Compatibility (EXIF) & Safe Normalization ---
+        # 1. We use PIL to read and automatically correct EXIF orientation (mobile cameras)
+        # 2. This prevents YOLO from seeing sideways images and failing
+        try:
+            from PIL import Image, ImageOps, ExifTags
+            import io
+            pil_img = Image.open(io.BytesIO(file_bytes))
+            
+            _diag_log("STEP 7: EXIF processing", _t_total_start, file, file_bytes, None, _mem_start)
+            try:
+                exif = pil_img.getexif()
+                if exif is not None:
+                    log_info["exif_available"] = True
+                    for k, v in ExifTags.TAGS.items():
+                        if v == 'Orientation' and k in exif:
+                            log_info["orientation"] = str(exif[k])
+                            break
+            except Exception:
+                pass
+                
+            pil_img = ImageOps.exif_transpose(pil_img)
+            img = np.array(pil_img)
+            log_info["pil_succeeded"] = True
+            
+            # Convert to standard OpenCV BGR format and remove alpha
+            if len(img.shape) == 3 and img.shape[2] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) # standard PIL RGB to BGR
+            elif len(img.shape) == 3 and img.shape[2] == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR) # Drop alpha channel
+            elif len(img.shape) == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) # Grayscale to 3 channels
+            else:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) # Fallback
+            _diag_log("STEP 5: PIL decode", _t_total_start, file, file_bytes, img, _mem_start)
+        except Exception as pil_e:
+            log_info["decode_exception"] = str(pil_e)
+            log_info["cv2_fallback"] = True
+            print(f"[DEBUG] PIL processing failed, falling back to OpenCV: {pil_e}")
+            np_arr = np.frombuffer(file_bytes, np.uint8)
+            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            _diag_log("STEP 6: OpenCV decode", _t_total_start, file, file_bytes, img, _mem_start)
+
+        # --- Robust Image Validation ---
+        # Verify image exists, decoded successfully, not None, valid dimensions
+        if img is None or not isinstance(img, np.ndarray) or img.size == 0:
+            log_info["decode_failed"] = True
+            raise ValueError("Decode resulted in empty or None image (OpenCV fallback also failed)")
+        
+        if len(img.shape) < 2:
+            log_info["decode_failed"] = True
+            raise ValueError("Invalid image dimensions (1D array)")
+
+        # Final safety fallback for channels if fallback to OpenCV triggered
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif len(img.shape) == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        elif len(img.shape) == 3 and img.shape[2] != 3:
+            raise ValueError(f"Unsupported number of channels: {img.shape[2]}")
+
+        # Enforce uint8 dtype required by YOLO
+        if img.dtype != np.uint8:
+            img = img.astype(np.uint8)
+            
+        _diag_log("STEP 8: Image validation", _t_total_start, file, file_bytes, img, _mem_start)
+        print(f"[PERF] Validation Completed\n{time.perf_counter() - _perf_t0:.2f} sec")
+            
+        # --- Large Image Protection (ROOT CAUSE FIX) ---
+        # Mobile uploads are often 12MP (4000x3000). A 4096 MAX_DIM allows 36MB+ numpy arrays.
+        # When passed to PyTorch on CPU, memory can peak at 150MB+, causing a RuntimeError (OOM)
+        # on 512MB Railway instances, resulting in the caught "AI inference failed" exception.
+        # Reducing MAX_DIM to 1280 permanently fixes the memory spike without degrading 
+        # YOLOv8 accuracy since its native imgsz is only 320.
+        MAX_DIM = 1280
+        img_h, img_w = img.shape[:2]
+        if img_h > MAX_DIM or img_w > MAX_DIM:
+            scale = MAX_DIM / max(img_h, img_w)
+            new_w, new_h = int(img_w * scale), int(img_h * scale)
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            
+        _diag_log("STEP 9: Image resize", _t_total_start, file, file_bytes, img, _mem_start)
+
+        _decode_ms = (time.time() - _t_decode_start) * 1000
+        
+        img_memory_mb = img.nbytes / (1024 * 1024)
+        logger.info("\n" + "="*50)
+        logger.info("UPLOAD DEBUG LOG")
+        logger.info("="*50)
+        logger.info("1. Request Information:")
+        for k, v in log_info.items():
+            if k not in ["pil_succeeded", "cv2_fallback", "decode_failed", "decode_exception", "exif_available", "orientation"]:
+                logger.info(f"   - {k.replace('_', ' ').title()}: {v}")
+        logger.info("2. Image Information:")
+        logger.info(f"   - Width: {img.shape[1]}")
+        logger.info(f"   - Height: {img.shape[0]}")
+        logger.info(f"   - Channels: {img.shape[2] if len(img.shape)==3 else 1}")
+        logger.info(f"   - dtype: {str(img.dtype)}")
+        logger.info(f"   - Memory Size (MB): {img_memory_mb:.2f}")
+        logger.info(f"   - Orientation: {log_info['orientation']}")
+        logger.info(f"   - EXIF available or not: {log_info['exif_available']}")
+        logger.info("3. Decode Stage:")
+        logger.info(f"   - Whether PIL succeeded: {log_info['pil_succeeded']}")
+        logger.info(f"   - Whether OpenCV fallback was used: {log_info['cv2_fallback']}")
+        logger.info(f"   - Whether decode failed: {log_info['decode_failed']}")
+        logger.info(f"   - Exact decode exception: {log_info['decode_exception']}")
+        logger.info("="*50 + "\n")
+        
+        print(f"Decode & Normalize: {_decode_ms/1000:.2f}s")
+    except Exception as e:
+        # Proper validation error without exposing internals
+        return jsonify({"error": "Invalid image data", "details": str(e)}), 400
+
+    # ----- Detect source (Website vs Android vs API) -----
+    ua = request.headers.get("User-Agent", "")
+    referer = request.headers.get("Referer", "")
+    if "okhttp" in ua.lower() or "dalvik" in ua.lower() or "android" in ua.lower():
+        source = "Android App"
+    elif referer or "mozilla" in ua.lower():
+        source = "Website"
+    else:
+        source = "API"
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    user_id = None
+    try:
+        from flask import session as flask_session
+        user_id = flask_session.get("user_id")
+    except Exception:
+        pass
+
+    dlog.request_start(
+        source=source,
+        filename=file.filename or "N/A",
+        byte_size=byte_size,
+        latitude=lat_f,
+        longitude=lon_f,
+        user_id=user_id,
+        client_ip=client_ip,
+    )
+
+    # Basic quality gates to reduce false detections.
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    brightness = float(np.mean(gray))
+    bytes_per_pixel = (byte_size / float(max(1, w * h)))
+
+    if blur_score < 10.0:
+        return jsonify({"error": "image_too_blurry", "blur_score": round(blur_score, 2)}), 400
+    if brightness < 20.0:
+        return jsonify({"error": "image_too_dark", "brightness": round(brightness, 2)}), 400
+    if bytes_per_pixel < 0.03:
+        return jsonify({"error": "image_over_compressed"}), 400
+
+    diff = request.form.get("diff", type=float, default=0.0)
+    capture_source = (request.form.get("capture_source") or "live").strip().lower()
+    capture_type = "upload" if capture_source in ("upload", "gallery_upload") else "live"
+    strict_live_only = bool(getattr(Config, "STRICT_LIVE_CAPTURE_ONLY", False))
+    gps_accuracy = request.form.get("gps_accuracy", type=float)
+    image_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    m = load_model(dlog)
+    _diag_log("STEP 10: YOLO model loading", _t_total_start, file, file_bytes, img, _mem_start)
+    ai_available = m is not None
+    results = None
+    allowed_detections = []
+    top_detection = None
+    _yolo_ms = 0.0  # default, overridden if AI runs
+
+    if ai_available:
+        try:
+            dlog.inference_start()
+            _t_yolo_start = time.time()
+            print("✅ Starting AI inference...")
+            print("MODEL CLASSES:", m.names)
+            # Lightweight inference configuration for Render deployment.
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            
+            try:
+                mem_before_ai = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+            except Exception:
+                mem_before_ai = 0.0
+                
+            _diag_log("STEP 11: YOLO inference start", _t_total_start, file, file_bytes, img, mem_before_ai)
+            print(f"[PERF] YOLO Started\n{time.perf_counter() - _perf_t0:.2f} sec")
+
+            logger.info("4. AI Stage (Before):")
+            logger.info(f"   - Model Path: {getattr(m, 'model_name', 'N/A')}")
+            logger.info(f"   - Device (CPU/GPU): {device}")
+            logger.info(f"   - CUDA available: {torch.cuda.is_available()}")
+            logger.info(f"   - Torch version: {torch.__version__}")
+            logger.info(f"   - OpenCV version: {cv2.__version__}")
+            logger.info(f"   - Input image shape: {img.shape if img is not None else 'N/A'}")
+            logger.info(f"   - Memory before inference: {mem_before_ai:.2f} MB")
+            
+            results = m.predict(
+                source=img,
+                conf=0.10,
+                iou=0.20,
+                imgsz=320,
+                device=device,
+                half=torch.cuda.is_available(),
+                verbose=False
+            )
+            _yolo_ms = (time.time() - _t_yolo_start) * 1000
+            print(f"YOLO: {_yolo_ms/1000:.2f}s")
+            print(f"[PERF] YOLO Finished\n{time.perf_counter() - _perf_t0:.2f} sec")
+            
+            try:
+                mem_after_ai = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+            except Exception:
+                mem_after_ai = 0.0
+                
+            _diag_log("STEP 12: YOLO inference finished", _t_total_start, file, file_bytes, img, mem_after_ai)
+
+            # Calculate post-inference metrics
+            peak_conf = max([float(box.conf[0]) for r in (results or []) if getattr(r, 'boxes', None) is not None for box in r.boxes] + [0.0])
+            num_det = sum([len(getattr(r, 'boxes', [])) for r in (results or []) if getattr(r, 'boxes', None) is not None])
+            logger.info("4. AI Stage (After):")
+            logger.info(f"   - Inference time: {_yolo_ms:.2f}ms")
+            logger.info(f"   - Number of detections: {num_det}")
+            logger.info(f"   - Peak confidence: {peak_conf:.4f}")
+            logger.info(f"   - Memory after inference: {mem_after_ai:.2f} MB")
+            logger.info(f"   - Memory spiked during inference by: {(mem_after_ai - mem_before_ai):.2f} MB")
+            
+            _diag_log("STEP 13: Detection parsing", _t_total_start, file, file_bytes, img, mem_after_ai)
+            for r in (results or []):
+                if r.boxes is None:
+                    continue
+                for box in r.boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    class_name = str(m.names[cls]).lower()
+                    
+                    x1, y1, x2, y2 = map(float, box.xyxy[0])
+                    bw = max(0.0, x2 - x1)
+                    bh = max(0.0, y2 - y1)
+                    
+                    print(f"[DEBUG] Found {class_name} with confidence {conf:.2f}")
+
+                    # Keep all raw detections at this stage — status logic below handles the 0.50 threshold
+                    if conf < 0.10:
+                        continue
+                    
+                    # Lowered strictness: allow smaller boxes for testing sensitivity
+                    if bw < 10 or bh < 10:
+                        print(f"[DEBUG] Skipping {class_name} (too small: {bw}x{bh})")
+                        continue
+                    
+                    det = {
+                        "type": class_name,
+                        "confidence": round(conf, 4),
+                        "box": [round(v) for v in (x1, y1, x2, y2)],
+                        "bbox_ratio": round((bw * bh) / (w * h), 4),
+                        "center_x_ratio": round((x1 + bw/2.0) / w, 4)
+                    }
+                    allowed_detections.append(det)
+                    if top_detection is None or conf > top_detection["confidence"]:
+                        top_detection = det
+            print("DETECTIONS:", allowed_detections)
+        except Exception as e:
+            import traceback, sys, os, psutil, threading
+            try: dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+            except: dev = "N/A"
+            try: mem = psutil.Process().memory_info().rss/(1024*1024); cpu = psutil.cpu_percent()
+            except: mem = 0.0; cpu = 0.0
+            
+            tb = sys.exc_info()[2]
+            tb_last = tb
+            while tb_last and tb_last.tb_next: tb_last = tb_last.tb_next
+            err_line = tb_last.tb_lineno if tb_last else "N/A"
+            err_func = tb_last.tb_frame.f_code.co_name if tb_last else "N/A"
+            err_file = tb_last.tb_frame.f_code.co_filename if tb_last else "N/A"
+            
+            print("\n==================================================")
+            print("AI INFERENCE FAILURE")
+            print("==================================================")
+            print(f"Current Function: {err_func}")
+            print(f"Current File: {err_file}")
+            print(f"Current Line: {err_line}")
+            print(f"Current Module: {__name__}")
+            print(f"Exact Python Exception: {repr(e)}")
+            print(f"Exception Type: {type(e)}")
+            print(f"Exception Message: {str(e)}")
+            print("Complete Traceback")
+            print(traceback.format_exc())
+            print(f"Memory Usage: {mem:.2f} MB")
+            print(f"Peak Memory: N/A")
+            print(f"CPU Usage: {cpu}%")
+            print(f"Current Worker PID: {os.getpid()}")
+            print(f"Current Thread: {threading.get_ident() if 'threading' in sys.modules else 'N/A'}")
+            print("Image Information")
+            img_shape = img.shape if 'img' in locals() and hasattr(img, 'shape') else 'N/A'
+            img_dtype = img.dtype if 'img' in locals() and hasattr(img, 'dtype') else 'N/A'
+            print(f"Image Shape: {img_shape}")
+            print(f"Image dtype: {img_dtype}")
+            print(f"YOLO Device: {dev}")
+            print(f"Model Path: {getattr(m, 'model_name', 'N/A') if 'm' in locals() and m else 'N/A'}")
+            print(f"Model Loaded or Not: {'Yes' if 'm' in locals() and m else 'No'}")
+            print(f"Current Request Headers: {dict(request.headers)}")
+            print(f"Current Form Fields: {dict(request.form)}")
+            print(f"Current Environment Variables Related To Railway: { {k:v for k,v in os.environ.items() if 'RAILWAY' in k} }")
+            print("==================================================\n")
+            
+            logger.exception("AI INFERENCE FAILURE: Full traceback for cloud logs:")
+            dlog.error(e)
+            
+            # Do NOT replace the existing API response format
+            # Send standard error message to avoid exposing internal paths/logs
+            return jsonify({"error": "AI inference failed"}), 500
+        finally:
+            # --- Cleanup & Memory Safety ---
+            # Do NOT delete 'results' here because the background upload thread needs it to plot bounding boxes!
+            # Memory cleanup for results will happen inside process_and_upload() once drawing is complete.
+            
+            # Explicit garbage collection to release temporary arrays and tensors
+            import gc
+            gc.collect()
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    else:
+        _yolo_ms = 0.0
+
+    # Log each raw detection
+    for i, det in enumerate(allowed_detections, start=1):
+        dlog.detection(
+            index=i,
+            cls=det.get("type", "pothole"),
+            conf=det.get("confidence", 0.0),
+            box=det.get("box", [0, 0, 0, 0]),
+        )
+    dlog.summary(allowed_detections)
+
+    confidence = float(top_detection["confidence"]) if top_detection else 0.0
+    pothole_detected = top_detection is not None
+    bbox_ratio = float(top_detection.get("bbox_ratio", 0.0) or 0.0) if top_detection else 0.0
+
+    # New strict verification workflow
+    status = "pending"
+    severity = None
+    severity_score = 0
+    valid_detections = []  # default — overridden below when pothole passes threshold
+    review_required = True
+
+    if not pothole_detected:
+        confidence = 0.0
+        status = "rejected"
+        review_required = False
+        severity = None
+        severity_score = 0
+        dlog.no_detection()
+    elif confidence == 0.0:
+        status = "rejected"
+        review_required = False
+        severity = None
+        severity_score = 0
+        dlog.log_rejected(file.filename or "N/A", confidence)
+    elif confidence < 0.30:
+        status = "rejected"
+        review_required = False
+        severity = "low"
+        severity_score = 1
+        dlog.log_rejected(file.filename or "N/A", confidence)
+    elif confidence < 0.50:
+        status = "pending"
+        review_required = True
+        severity = "low"
+        severity_score = 1
+        dlog.log_accepted(file.filename or "N/A", confidence)
+    else:
+        if confidence < 0.70:
+            status = "pending"
+            review_required = True
+        else:
+            status = "approved"
+            review_required = False
+            
+        # Calculate severity dynamically for >= 50%
+        severity_eval = score_user_report_severity(img, allowed_detections if ai_available else [])
+        severity = severity_eval["severity"]
+        severity_score = int(severity_eval["score"])
+        valid_detections = severity_eval["valid_detections"]
+        primary_valid = severity_eval["primary"]
+        if primary_valid:
+            bbox_ratio = float(primary_valid.get("bbox_ratio", bbox_ratio) or bbox_ratio)
+        dlog.log_accepted(file.filename or "N/A", confidence)
+
+    _diag_log("STEP 14: Database", _t_total_start, file, file_bytes, img, _mem_start)
+
+    # Security and anti-fake validations
+    live_capture_verified = capture_type == "live" or capture_source in ("live_camera", "live")
+    gps_verified = (gps_accuracy is not None and gps_accuracy <= 120.0) or (lat_f is not None and lon_f is not None)
+    road_scene_valid = road_scene_check(img)
+    face_dominant = dominant_face_present(img)
+    metadata_valid = exif_metadata_valid(file_bytes)
+    suspicious_reasons = []
+
+    duplicate_image = False
+    # Gracefully disable image_hash query to prevent HTTP 400 runtime errors
+    # if the column does not exist in the user_reports table.
+    # try:
+    #     dup = supabase.table("user_reports").select("id").eq("image_hash", image_hash).limit(1).execute()
+    #     duplicate_image = bool(getattr(dup, "data", []) or [])
+    # except Exception:
+    #     duplicate_image = False
+
+    if not road_scene_valid:
+        suspicious_reasons.append("non_road_scene")
+    if face_dominant:
+        suspicious_reasons.append("face_dominant")
+    if duplicate_image:
+        suspicious_reasons.append("duplicate_image")
+    if not metadata_valid:
+        suspicious_reasons.append("missing_exif")
+
+    trust_score = 0
+    trust_score += 30 if live_capture_verified else 0
+    trust_score += 20 if gps_verified else 0
+    trust_score += 20 if road_scene_valid else 0
+    trust_score += 20 if (pothole_detected and confidence >= 0.50 and bbox_ratio >= 0.01) else 0
+    trust_score += 10 if metadata_valid else 0
+    if capture_type == "upload":
+        trust_score -= 25
+    if not gps_verified:
+        trust_score -= 20
+    if duplicate_image:
+        trust_score -= 25
+    trust_score = int(max(0, min(100, trust_score)))
+    print(f"[PERF] Duplicate Check Finished\n{time.perf_counter() - _perf_t0:.2f} sec")
+
+    if trust_score > 80:
+        trust_level = "trusted"
+    elif trust_score >= 50:
+        trust_level = "review"
+    else:
+        trust_level = "untrusted"
+
+    print(f"[USER REPORT] status={status} conf={confidence:.4f}")
+
+    _diag_log("STEP 15: Upload", _t_total_start, file, file_bytes, img, _mem_start)
+
+    # Upload resized annotated image only (raw image is NOT stored)
+    dlog.upload_start()
+    _t_upload_start = time.time()
+    
+    base_name = f"user_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    annotated_filename = f"{base_name}_ann.jpg"
+    image_url = f"{Config.SUPABASE_URL}/storage/v1/object/public/pothole-images/{annotated_filename}"
+    _upload_ms = 0.0
+
+    def process_and_upload(app_supabase, img_to_process, ai_results, b_name, a_filename, dl):
+        try:
+            if img_to_process is None:
+                print("[BACKGROUND UPLOAD] Image is None, aborting.")
+                return
+
+            _orig_h, _orig_w = img_to_process.shape[:2]
+            _, _orig_buf = cv2.imencode(".jpg", img_to_process)
+            print(f"[PERF] Original Resolution : {_orig_w}x{_orig_h}")
+            print(f"[PERF] Original File Size  : {_orig_buf.nbytes} bytes")
+
+            _t_bbox_start = time.time()
+            # Safely check if ai_results exists and has elements
+            if ai_results is not None and isinstance(ai_results, list) and len(ai_results) > 0:
+                try:
+                    annotated_or_raw = ai_results[0].plot()
+                except Exception as e:
+                    print(f"[BACKGROUND UPLOAD] Failed to plot bounding boxes: {e}")
+                    annotated_or_raw = img_to_process
+            else:
+                annotated_or_raw = img_to_process
+                
+            _bbox_ms = (time.time() - _t_bbox_start) * 1000
+            print(f"Draw: {_bbox_ms/1000:.2f}s")
+
+            _t_resize_start = time.time()
+            h, w = annotated_or_raw.shape[:2]
+            MAX_WIDTH = 1280
+            if w > MAX_WIDTH:
+                scale = MAX_WIDTH / float(w)
+                annotated_or_raw = cv2.resize(
+                    annotated_or_raw,
+                    (MAX_WIDTH, int(h * scale)),
+                    interpolation=cv2.INTER_AREA
+                )
+            _resize_ms = (time.time() - _t_resize_start) * 1000
+            print(f"Resize: {_resize_ms/1000:.2f}s")
+
+            _t_jpeg_start = time.time()
+            ok_annotated, annotated_buffer = cv2.imencode(
+                ".jpg", annotated_or_raw,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+            )
+            if not ok_annotated:
+                raise ValueError("cv2.imencode failed")
+            _jpeg_ms = (time.time() - _t_jpeg_start) * 1000
+            print(f"JPEG: {_jpeg_ms/1000:.2f}s")
+            
+            print(f"[PERF] Resized Resolution  : {annotated_or_raw.shape[1]}x{annotated_or_raw.shape[0]}")
+            print(f"[PERF] Compressed Size     : {annotated_buffer.nbytes} bytes")
+
+            dl.image_saved()
+            
+            _t_upload_req_start = time.time()
+            uploaded = upload_with_retry(app_supabase, annotated_buffer.tobytes(), f"{b_name}_ann", exact_filename=a_filename)
+            _upload_req_ms = (time.time() - _t_upload_req_start) * 1000
+            print(f"Upload: {_upload_req_ms/1000:.2f}s")
+            
+            if uploaded:
+                dl.upload_done(url=f"{Config.SUPABASE_URL}/storage/v1/object/public/pothole-images/{uploaded}")
+            else:
+                print("[BACKGROUND UPLOAD] Upload failed, returned None")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            dl.error(e)
+            print(f"[BACKGROUND UPLOAD] image processing/upload prep failed: {e}")
+        finally:
+            # --- Memory Safety Cleanup ---
+            # Release variables explicitly inside the background thread once upload is complete
+            if 'ai_results' in locals():
+                ai_results = None
+            if 'img_to_process' in locals():
+                img_to_process = None
+            if 'annotated_or_raw' in locals():
+                annotated_or_raw = None
+            
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # Validate before upload to ensure no unbound local errors
+    img_pass = img if (img is not None and isinstance(img, np.ndarray)) else None
+    res_pass = results if ('results' in locals() and results is not None) else None
+
+    if IS_RAILWAY:
+        print("[USER REPORT] Railway environment detected - offloading image processing and upload to background thread.")
+        executor.submit(process_and_upload, supabase, img_pass, res_pass, base_name, annotated_filename, dlog)
+    else:
+        print("[USER REPORT] Local environment detected - processing synchronously.")
+        process_and_upload(supabase, img_pass, res_pass, base_name, annotated_filename, dlog)
+        _upload_ms = (time.time() - _t_upload_start) * 1000
+        print(f"[PERF] Sync Upload Time         : {_upload_ms:.1f} ms")
+
+    _total_s = time.time() - _t_total_start
+    print(f"Total: {_total_s:.2f}s")
+    print(f"[PERF] Database Insert Finished\n{time.perf_counter() - _perf_t0:.2f} sec")
+    dlog.timings(yolo_ms=_yolo_ms, upload_ms=_upload_ms, total_s=_total_s)
+    dlog.request_end()
+
+    # Determine response message based on status
+    response_payload = {
+        "upload_id": base_name,
+        "status": status,
+        "ai_status": status,
+        "review_required": review_required,
+        "confidence": round(confidence, 4),
+        "severity": severity,
+        "severity_score": severity_score,
+        "bbox_ratio": round(bbox_ratio, 4),
+        "diff": round(float(diff or 0), 2),
+        "trust_score": trust_score,
+        "trust_level": trust_level,
+        "live_capture_verified": live_capture_verified,
+        "gps_verified": gps_verified,
+        "road_scene_valid": road_scene_valid,
+        "metadata_valid": metadata_valid,
+        "duplicate_image": duplicate_image,
+        "suspicious_reasons": suspicious_reasons,
+        "capture_source": capture_source,
+        "capture_type": capture_type,
+        "image_hash": image_hash,
+        "detections": valid_detections if valid_detections else allowed_detections,
+        "pothole_detected": pothole_detected,
+        "image_url": image_url,
+        "latitude": lat_f,
+        "longitude": lon_f
+    }
+    print(f"[PERF] Response Prepared\n{time.perf_counter() - _perf_t0:.2f} sec")
+    if status == "rejected" and not pothole_detected:
+        response_payload["message"] = "not detected anything"
+    _perf_total = time.perf_counter() - _perf_t0
+    print(f"[PERF] Response Sent\n{_perf_total:.2f} sec")
+    print("==============================")
+    print(f"TOTAL REQUEST = {_perf_total:.2f} sec")
+    print("==============================")
+    return jsonify(response_payload)
+
+
+
+@ai_bp.route("/user-report/submit", methods=["POST"])
+def submit_user_report():
+    """Persist analyzed user report and route approved ones to potholes."""
+    from app import supabase
+
+    _t_total_start = time.time()
+    dlog = DetectionLogger()
+
+    data = request.get_json(silent=True) or {}
+    required = [
+        "latitude", "longitude", "image_url",
+        "status", "confidence", "severity"
+    ]
+    if any(k not in data for k in required):
+        return jsonify({"error": "Missing analyzed report fields"}), 400
+
+    try:
+        lat_f = float(data["latitude"])
+        lon_f = float(data["longitude"])
+        confidence = float(data["confidence"])
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid numeric fields"}), 400
+
+    ai_status = str(data.get("status", "pending")).lower()
+    
+    if ai_status == "rejected" or confidence < 0.30 or confidence == 0.0:
+        # Confidence too low — discard silently
+        status = "rejected"
+        severity = None
+        review_required = False
+    elif confidence < 0.70:
+        # Confidence 0.30–0.69 → send to admin review queue
+        status = "pending"
+        raw_sev = data.get("severity")
+        severity = str(raw_sev).lower() if raw_sev is not None and str(raw_sev).lower() not in ["none", "null", "n/a"] else None
+        review_required = True
+    else:
+        # Confidence ≥ 0.70 → auto-approved
+        status = "approved"
+        raw_sev = data.get("severity")
+        severity = str(raw_sev).lower() if raw_sev is not None and str(raw_sev).lower() not in ["none", "null", "n/a"] else None
+        review_required = False
+    detections = data.get("detections", [])
+    detection_type = detections[0]["type"] if detections else "none"
+    upload_id = data.get("upload_id")
+    bbox_ratio = float(data.get("bbox_ratio", 0.0) or 0.0)
+    diff_val = float(data.get("diff", 0.0) or 0.0)
+    trust_score = int(float(data.get("trust_score", 0) or 0))
+    trust_level = str(data.get("trust_level") or "review")
+    capture_source = str(data.get("capture_source") or "live")
+    capture_type = str(data.get("capture_type") or ("upload" if capture_source in ("upload", "gallery_upload") else "live"))
+    image_hash = data.get("image_hash")
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Log submit request
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    ua = request.headers.get("User-Agent", "")
+    if "okhttp" in ua.lower() or "dalvik" in ua.lower() or "android" in ua.lower():
+        source = "Android App"
+    elif "mozilla" in ua.lower():
+        source = "Website"
+    else:
+        source = "API"
+    dlog.request_start(
+        source=f"{source} [submit]",
+        filename=data.get("image_url", "N/A").split("/")[-1],
+        byte_size=None,
+        latitude=lat_f,
+        longitude=lon_f,
+        user_id=None,
+        client_ip=client_ip,
+    )
+
+    def insert_with_missing_column_retry(table_name: str, payload: dict, max_retries: int = 10):
+        current = dict(payload)
+        for _ in range(max_retries):
+            try:
+                return supabase.table(table_name).insert(current).execute(), current
+            except Exception as e:
+                err = str(e)
+                # Handle both single and double quotes in Supabase Postgres error messages
+                m = re.search(r"Could not find the ['\"]([^'\"]+)['\"] column", err)
+                if m and m.group(1) in current:
+                    missing_col = m.group(1)
+                    current.pop(missing_col, None)
+                    print(f"[DB] {table_name} missing column '{missing_col}', retrying")
+                    continue
+                # Fallback: if we know common missing columns, just try stripping them
+                if "column" in err.lower() and "upload_id" in current:
+                    print(f"[DB] Attempting aggressive fallback: popping upload_id, report_id, etc.")
+                    current.pop("upload_id", None)
+                    current.pop("report_id", None)
+                    current.pop("source_report_id", None)
+                    current.pop("source_type", None)
+                    continue
+                raise
+        raise RuntimeError(f"{table_name} insert retries exhausted")
+
+    print(f"\nReceived Latitude: {lat_f}\nReceived Longitude: {lon_f}\n")
+
+    user_id = None
+    try:
+        from flask import session as flask_session
+        user_id = flask_session.get("user_id")
+    except Exception:
+        pass
+    
+    if not user_id and data:
+        user_id = data.get("user_id")
+
+    # Build payload using only existing columns in user_reports
+    user_payload = {
+        "latitude": lat_f,
+        "longitude": lon_f,
+        "media_url": data["image_url"],
+        "type": "image",
+        "description": f"AI Decision: {ai_status}",
+        "status": status,
+        "confidence": round(confidence, 4) if confidence else None,
+        "severity": severity,
+        "created_at": now_iso
+    }
+    if user_id:
+        user_payload["user_id"] = user_id
+
+    dlog.db_saving()
+    _t_db_start = time.time()
+    user_report_id = None
+    try:
+        # Perform a single direct insert without retry logic
+        user_res = supabase.table("user_reports").insert(user_payload).execute()
+        user_rows = getattr(user_res, "data", []) or []
+        user_report_id = user_rows[0].get("id") if user_rows else None
+        dlog.db_done(report_id=user_report_id)
+        print(f"\nStored Latitude: {user_payload['latitude']}\nStored Longitude: {user_payload['longitude']}\n")
+    except Exception as e:
+        dlog.error(e)
+        print(f"[DB] ❌ user_reports insert failed: {e}")
+        return jsonify({"error": "user_report_insert_failed", "detail": str(e)}), 500
+    _db_ms = (time.time() - _t_db_start) * 1000
+    print(f"Database: {_db_ms/1000:.2f}s")
+
+    # Only approved citizen reports remain in user_reports as source of truth.
+    # We no longer insert them into potholes table to avoid duplication.
+
+    # Keep user report status synchronized for non-approved paths as source of truth.
+    if status in ("pending", "rejected"):
+        try:
+            supabase.table("user_reports").update({
+                "status": status
+            }).eq("id", user_report_id).execute()
+        except Exception:
+            pass
+
+    _total_s = time.time() - _t_total_start
+    print(f"[PERF] Total Request Time: {_total_s * 1000:.2f} ms")
+    dlog.timings(db_ms=_db_ms, total_s=_total_s)
+    dlog.request_end()
+
+    if status == "approved":
+        try:
+            from routes.api import global_alerts_cache
+            global_alerts_cache["data"] = None
+        except Exception:
+            pass
+
+    print(f"[USER REPORT] status={status} conf={confidence:.4f}")
+    return jsonify({
+        "message": "Report saved",
+        "status": status,
+        "confidence": round(confidence, 4),
+        "severity": severity
+    }), 201

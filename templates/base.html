@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}VisionaryRoad{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+    rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/design_system.css') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/glassmorphism.css') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/modal.css') }}" />
+  {% if session.get('role') == 'worker' %}
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/worker.css') }}" />
+  {% endif %}
+  {% block head %}{% endblock %}
+</head>
+
+<body class="dashboard-body">
+
+  <!-- Ambient Background Elements -->
+  <div class="ambient-bg">
+    <div class="ambient-orb orb-1"></div>
+    <div class="ambient-orb orb-2"></div>
+    <div class="ambient-orb orb-3"></div>
+  </div>
+
+  <!-- Mobile Sidebar Overlay -->
+  <div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+  <!-- ════ SIDEBAR ════════════════════════════════════════════════════════ -->
+  <aside class="sidebar">
+    <div class="sidebar-header" style="margin-bottom: 15px;">
+      <div class="sidebar-brand premium-brand">
+        <div class="brand-icon-premium">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 12c0 0 3.5-7 10-7s10 7 10 7-3.5 7-10 7-10-7-10-7z"></path>
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M12 15v7"></path>
+            <path d="M8 22h8"></path>
+          </svg>
+        </div>
+        <span class="brand-text-premium">VisionaryRoad</span>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav">
+      <div class="nav-section">
+        <div class="nav-label">Core Monitoring</div>
+        <a href="{{ url_for('pages.dashboard') }}" class="nav-item {% if page=='dashboard' %}active{% endif %}">
+          <i class="fa-solid fa-gauge-high"></i><span>Dashboard</span>
+        </a>
+        <a href="{{ url_for('pages.image_logs') }}" class="nav-item {% if page=='image_logs' %}active{% endif %}">
+          <i class="fa-solid fa-images"></i><span>Image Logs</span>
+        </a>
+        <a href="{{ url_for('pages.navigation') }}" class="nav-item {% if page=='navigation' %}active{% endif %}">
+          <i class="fa-solid fa-route"></i><span>Safe Navigation</span>
+        </a>
+        <a href="{{ url_for('pages.report') }}" class="nav-item {% if page=='report' %}active{% endif %}">
+          <i class="fa-solid fa-camera"></i><span>Report Pothole</span>
+        </a>
+      </div>
+
+      {% if session.get('role') == 'worker' %}
+      <div class="nav-section">
+        <div class="nav-label">Work Management</div>
+        <a href="{{ url_for('pages.worker_available_jobs') }}"
+          class="nav-item {% if page=='worker_available_jobs' %}active{% endif %}">
+          <i class="fa-solid fa-briefcase"></i><span>Available Jobs</span>
+          <span class="wk-count-badge" style="position:static; margin-left:auto;">3</span>
+        </a>
+        <a href="{{ url_for('pages.worker_active_job') }}"
+          class="nav-item {% if page=='worker_active_job' %}active{% endif %}">
+          <i class="fa-solid fa-hammer"></i><span>My Active Job</span>
+        </a>
+        <a href="{{ url_for('pages.worker_history') }}"
+          class="nav-item {% if page=='worker_history' %}active{% endif %}">
+          <i class="fa-solid fa-clock-rotate-left"></i><span>Work History</span>
+        </a>
+        
+      </div>
+      <div class="nav-section">
+        <div class="nav-label">Account</div>
+        <a href="{{ url_for('pages.worker_profile') }}"
+          class="nav-item {% if page=='worker_profile' %}active{% endif %}">
+          <i class="fa-solid fa-user"></i><span>Profile</span>
+        </a>
+        
+      </div>
+      {% endif %}
+
+      {% if session.get('role') == 'admin' %}
+      <div class="nav-section">
+        <div class="nav-label">Maintenance</div>
+        <a href="{{ url_for('pages.alerts') }}" class="nav-item {% if page=='alerts' %}active{% endif %}">
+          <i class="fa-solid fa-triangle-exclamation"></i><span>Alerts</span>
+        </a>
+        <a href="{{ url_for('pages.analytics') }}" class="nav-item {% if page=='analytics' %}active{% endif %}">
+          <i class="fa-solid fa-chart-line"></i><span>Analytics</span>
+        </a>
+       
+        <a href="{{ url_for('pages.admin_verification') }}"
+          class="nav-item {% if page=='admin_verification' %}active{% endif %}">
+          <i class="fa-solid fa-clipboard-check"></i><span>Worker Verification</span>
+        </a>
+      </div>
+
+      <div class="nav-section">
+        <div class="nav-label">System</div>
+        <a href="{{ url_for('pages.settings') }}" class="nav-item {% if page=='settings' %}active{% endif %}">
+          <i class="fa-solid fa-gear"></i><span>Settings</span>
+        </a>
+        <a href="{{ url_for('pages.admin_workers') }}" class="nav-item {% if page=='admin_workers' %}active{% endif %}">
+          <i class="fa-solid fa-users-gear"></i><span>Worker Management</span>
+        </a>
+        <a href="{{ url_for('pages.admin') }}" class="nav-item {% if page=='admin' %}active{% endif %}">
+          <i class="fa-solid fa-user-shield"></i><span>Admin Panel</span>
+        </a>
+        <a href="{{ url_for('pages.user_reports') }}" class="nav-item {% if page=='admin_reports' %}active{% endif %}">
+          <i class="fa-solid fa-clipboard-list"></i><span>User Reports</span>
+        </a>
+      </div>
+      {% endif %}
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="user-profile-card">
+        <div class="user-avatar-circle">
+          {{ session.get('name', 'A')[0] | upper }}
+        </div>
+        <div class="user-meta-info">
+          <span class="user-name" id="sidebar-user">{{ session.get('name', 'Admin') }}</span>
+          <span class="user-role-tag">{{ session.get('role', 'Admin') | capitalize }}</span>
+        </div>
+        <button class="logout-btn" onclick="handleLogout()" title="Sign Out">
+          <i class="fa-solid fa-right-from-bracket"></i>
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <script>
+    async function handleLogout() {
+      const confirmed = await window.showConfirm({
+        title: 'Sign Out',
+        message: 'Are you sure you want to sign out?',
+        confirmText: 'Yes, Sign Out',
+        cancelText: 'Cancel',
+        confirmColor: 'primary'
+      });
+      if (confirmed) {
+        await fetch('/api/logout', { method: 'GET' });
+        window.location.href = '/login';
+      }
+    }
+  </script>
+
+  <!-- ════ TOPBAR ═════════════════════════════════════════════════════════ -->
+  <header class="topbar">
+    <button class="sidebar-toggle" id="sidebarToggle">
+      <i class="fa-solid fa-bars"></i>
+    </button>
+    <h1 class="topbar-title">{% block page_title %}Dashboard{% endblock %}</h1>
+    <div class="topbar-actions">
+      <div class="notification-bell" id="notifBell">
+        <i class="fa-solid fa-bell"></i>
+        <span class="notif-badge" id="notifBadge" style="display:none">0</span>
+      </div>
+      <div class="status-dot" title="System Active"></div>
+    </div>
+  </header>
+
+  <!-- ════ MAIN CONTENT ═══════════════════════════════════════════════════ -->
+  <main class="main-content" id="mainContent">
+    {% block content %}{% endblock %}
+  </main>
+
+  <!-- Modals converted to new custom API -->
+
+  <!-- Assign Modal (Kept due to complex multi-input form) -->
+  <div class="modal-overlay" id="assignModal" style="display:none">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3><i class="fa-solid fa-user-plus"></i> Assign Worker</h3>
+        <button class="modal-close" id="closeAssignModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="assignPotholeId" />
+        <div class="form-group" id="workerNameGroup">
+          <label>Worker Name</label>
+          <input type="text" id="assignWorkerName" placeholder="Enter worker name" class="form-input" />
+        </div>
+        <div class="form-group" id="statusGroup" style="display:none">
+          <label>Maintenance Status</label>
+          <select id="assignStatus" class="form-input">
+            <option value="Assigned">Assigned</option>
+            <option value="In Progress">In Progress</option>
+            <option value="Fixed">Fixed</option>
+          </select>
+        </div>
+        <div class="form-group" id="notesGroup">
+          <label>Notes</label>
+          <textarea id="assignNotes" placeholder="Optional notes" class="form-input" rows="3"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="closeAssignModal2">Cancel</button>
+        <button class="btn btn-primary" id="confirmAssign">Assign</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════ GLOBAL SCRIPTS ═════════════════════════════════════════════════ -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="{{ url_for('static', filename='js/modal.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+  {% block scripts %}{% endblock %}
+
+  <!-- Toast notification -->
+  <div id="toastContainer"></div>
+
+  <style>
+    .sidebar-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.4);
+      z-index: 150;
+      display: none;
+      backdrop-filter: blur(4px);
+    }
+
+    body.sidebar-open .sidebar-overlay {
+      display: block;
+    }
+
+    /* Premium AI Brand Styling */
+    .premium-brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 6px 0;
+      text-decoration: none;
+      cursor: pointer;
+    }
+
+    .brand-icon-premium {
+      width: 34px;
+      height: 34px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, #4f46e5, #3b82f6, #06b6d4);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      box-shadow: 0 8px 24px rgba(59, 130, 246, 0.35), inset 0 2px 4px rgba(255, 255, 255, 0.3);
+      transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+      position: relative;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+
+    .brand-icon-premium::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.2) 0%, rgba(255, 255, 255, 0) 100%);
+      border-radius: 12px;
+      pointer-events: none;
+    }
+
+    .premium-brand:hover .brand-icon-premium {
+      transform: scale(1.05) translateY(-3px);
+      box-shadow: 0 12px 32px rgba(59, 130, 246, 0.45), inset 0 2px 6px rgba(255, 255, 255, 0.4);
+    }
+
+    .brand-text-premium {
+      font-size: 1.1rem;
+      font-weight: 700;
+      font-family: 'Inter', sans-serif;
+      letter-spacing: 0.04em;
+      color: #ffffff;
+      background: linear-gradient(90deg, #ffffff, #94a3b8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      line-height: 1.2;
+    }
+  </style>
+</body>
+
+</html>
